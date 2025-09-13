@@ -1,67 +1,64 @@
-<# Upgrade Windows to Current Build
+<# Upgrade Windows 10 & 11 to Current Build
 https://github.com/IsaacGood/Upgrade-Windows-to-Current-Build-Powershell/
 
 This script will attempt to upgrade in various ways depending on the current version installed
 and the options selected below. Assuming all methods are allowed, it will:
-    - Exit if already on current build or build is incompatible with all allowed methods.
+    - Exit if less than Windows 10 or already on current build or build is incompatible with all allowed methods.
     - If the build is compatible with enablement, it applies the enablement CAB file. If that fails, it attempts the Update Assistant method.
     - If the build is compatible with enablement but the UBR is not, it attempts to install the required cumulative update.
     - If the build is incompatible with enablement (too old or 24H2) it attempts to upgrade via Update Assistant.
 
 Notes:
     - Read all the variables and make sure they're set appropriately for your environment!
+    - This script is optimized for Syncro RMM but runs without error on other platforms.
+      If you wish to remove/replace Syncro references, they're all in the Exit-WithError and Clear-Alert functions.
     - Make sure to increase the script timeout in your RMM to longer than your
       $TimeToWaitForCompletion + download time or you won't get full output in logs.
       Keep in mind depending on your RMM, it's possible no other scripts will run until it completes/times out.
     - For some reason silent install for Windows 11 Update Assistant doesn't work well in
       ScreenConnect Backstage, but works ok from RMM (usually).
 
-If you have issues upgrading, here are some things to check in order of commonality:
-    - The script output and any errors therein.
-    - Verify the device meets the Secure Boot, TPM, and CPU requirements and check the experience
-      indicators: https://www.deploymentresearch.com/understanding-upgrade-experience-indicators-for-windows-11-upgrade-readiness/
-    - Check for BIOS and driver updates from the hardware vendor.
-    - Check for corrupt/leftover/unneeded user profiles in c:\Users\ and HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList and remove them.
-    - Check for Windows Safeguard/Feature Blocks:
-        https://github.com/AdamGrossTX/FU.WhyAmIBlocked
-        https://garytown.com/windows-safeguard-hold-id-lookup-crowd-sourced
-        https://www.asquaredozen.com/2020/07/26/demystifying-windows-10-feature-update-blocks/
-    - Check c:\$Windows.~BT\Sources\Panther\setuperr.log for clues.
-    - In the same folder, open the most recent CompatData_<datestamp>.xml and check for any items with BlockingType="Hard"
-    - Run 'chkdsk /f', 'dism /Online /Cleanup-Image /CheckHealth', 'sfc /scannow' (in that order) to try and fix corruption/filesystem issues.
-    - On rare occasions, virtual printer drivers have caused issues, you can remove them with the following commands:
-        Remove-Printer -Name "Microsoft Print to PDF"
-        Remove-Printer -Name "Microsoft XPS Document Writer"
-    - If there's an error in setuperr.log: "Error encountered while adding provisioned APPX package: The package repository is corrupted."
-      you can try running this, rebooting and trying upgrade again: https://github.com/mardahl/PSBucket/blob/master/invoke-StateRepositoryReset.ps1
-
 Future development ideas:
     - Write attempted method to file/reg and then progressively try next method/alert if failed on next script run
+    - Set UpgradeEligibility registry key to avoid needing PC Health Check?
+    - Use scheduled task for running Win11 upgrade?
+    - Option for Start-BitsTransfer -TransferPolicy Unrestricted
+    - Options to allow upgrade from 7 to 10/11, 10 to 11
     - Integrate ISO upgrade script as another fallback method
     - Integrate DISM upgrade method?
-        DISM /Online /Cleanup-Image /RestoreHealth
-        DISM /Get-WimInfo /WimFile:<DriveLetter>:\sources\install.wim
-        DISM /Online /Apply-Image /ImageFile:<DriveLetter>:\sources\install.esd /Index:1 /ApplyDir:c:\
 
 Changelog:
-  2.0 / 2025-08-16 - Initial release of Windows 11 only version
-        Added - Check for client OS name so upgrade is not attempted on servers
-        Added - Variable for setting number of days for upgrade uninstall window
-        Changed - $DiskSpaceRequired to 40GB, this seems sufficient for all 10 to 11 upgrades, you might be able to get by with 30ish depending on the machine
-        Changed - Bypass Windows metered connection restriction by adding '-TransferPolicy Unrestricted' to Start-BitsTransfer in Get-Download function
-        Fixed - Remove ProductVersion registry setting along with TargetRelease/Version (optional)
-        Fixed - Use -ErrorAction SilentlyContinue on Get-ItemProperty for TargetReleaseVersion removal to avoid error if not present
+  1.3 / 2024-10-09
+        Changed - $Win11LatestVersion = 24H2
+        Added - Support for Win11 24H2 via Update Assistant (no enablement available)
+        Added - Support for ARM64 CPU enablement package
+        Added - Option to remove Windows Update Target Release Version registry settings (option to ignore only still exists)
+        Added - $RebootDelay variable and output of delay used
+        Added - $RebootWarningMessage variable to inform user of pending reboot
+        Fixed - Added decimal places to download function so enablement packages don't show as 0 MB
+	Fixed - Added TLS protocol settings to Get-Download to fix SSL error with some devices
+        Fixed - Corrected output for 'Already current or newer' condition to use $WinLatestVersion instead of $Win10LatestVersion
+  1.2 / 2023-11-19
+        Changed - Refactored to use more functions & variables (less redundant code)
+        Changed - Minimum build for enablement to 19042.1865 for 22H2
+        Changed - $Win1xTargetVersion to $Win1xLatestVersion to clarify they are only for determining if updates are needed
+        Added - Windows 11 Update Assistant & 23H2 enablement capabilities
+        Added - Optional installation of cumulative updates required for enablement packages
+        Added - Error catching and notification for failed downloads
+        Removed - Windows 10 21H2 enablement packages (end of servicing 6/13/2023)
+        Fixed - Wrapped Syncro commands in if's to eliminate errors when used with other platforms or in testing
+1.1.1 / 2023-08-04
+        Fixed - TargetReleaseVersion registry check had no Write-Output
+  1.1 / 2023-08-03
+        Changed - Syncro Alert name to 'Upgrade Windows', update any Automated Remediations accordingly
+        Changed - Improved error catching and notification
+        Added - Groundwork for support for Windows 11 (no enablement packages yet and UA won't upgrade under SYSTEM user)
+        Added - General code cleanup, improved consistency and documentation
+        Added - Support for Windows 10 x86 and 21H2 enablement packages
+        Fixed - Correct enablement minimum build (from 1247 to 1237)
+        Fixed - Removed UBR 1237 requirement for non-enablement that was causing script to fail on 18362.1856
+  1.0 / 2022-12-08 - Initial release
 #>
-
-# Upgrade Windows 10 to 11
-$UpgradeWindows10 = $true
-
-# Set uninstall window, in days (10-60, default 10)
-$UninstallWindow = '10'
-
-# Free disk space needed before using Update Assistant method
-# Failures observed with <20GB free for build updates and <40GB free for 10 to 11 upgrades
-$DiskSpaceRequired = '40' # in GBs
 
 # Reboot after upgrade (if changing this to $false also set $AttemptUpdateAssistant to $false)
 $RebootAfterUpgrade = $true
@@ -75,9 +72,11 @@ $AttemptCumulativeUpdate = $true
 # $true can cause a reboot regardless of reboot setting above as UA forces a restart
 $AttemptUpdateAssistant = $true
 
-# Handle Windows Update Blocks from ProductVersion/TargetRelease registry settings
-$IgnoreRegistryBlocks = $false # Allows script to run, but leaves registry settings in place
-$RemoveRegistryBlocks = $false # Removes registry settings so future upgrades aren't blocked
+# Ignore Windows Update TargetReleaseVersion registry settings
+$IgnoreTargetReleaseVersion = $false
+
+# Remove Windows Update TargetReleaseVersion registry settings
+$RemoveTargetReleaseVersion = $false
 
 # Location to download files
 $TargetFolder = "$env:Temp"
@@ -90,21 +89,31 @@ $TimeToWaitForCompletion = '180' # in minutes
 reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\OOBE /f /v DisablePrivacyExperience /t REG_DWORD /d 1 | Out-Null
 
 # Latest version of Windows currently available (for determining if updates are needed)
+$Win10LatestVersion = "22H2"
 $Win11LatestVersion = "24H2"
 
-# Enablement Packages
+# Enablement Packages (Windows 11 x86 doesn't exist)
+$Win10EPURLx64 = 'https://catalog.s.download.windowsupdate.com/c/upgr/2022/07/windows10.0-kb5015684-x64_d2721bd1ef215f013063c416233e2343b93ab8c1.cab'
+$Win10EPURLx86 = 'https://catalog.s.download.windowsupdate.com/c/upgr/2022/07/windows10.0-kb5015684-x86_3734a3f6f4143b645788cc77154f6288c8054dd5.cab'
+$Win10EPRequiredBuild = "19042"
+$Win10EPRequiredUBR = "1865"
 $Win11EPURLx64 = 'https://catalog.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/49a41627-758a-42b7-8786-cc61cc19f1ee/public/windows11.0-kb5027397-x64_955d24b7a533f830940f5163371de45ff349f8d9.cab'
 $Win11EPURLARM64 = 'https://catalog.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/719ca7b9-26eb-4de4-a45b-04ad2b58c807/public/windows11.0-kb5027397-arm64_1f7d9a4314296e4c35879d5438167ba7b60d895f.cab'
 $Win11EPRequiredBuild = "22621"
 $Win11EPRequiredUBR = "2506"
 
 # Cumulative Updates required for Enablement Packages
+$Win10CUKB = 'KB5026361'
+$Win10CUURL = 'https://catalog.s.download.windowsupdate.com/c/msdownload/update/software/secu/2023/05/windows10.0-kb5026361-x64_961f439d6b20735f067af766e1813936bf76cb94.msu'
+$Win10CURequiredBuild = "19042"
+$Win10CURequiredUBR = "985"
 $Win11CUKB = 'KB5032190'
 $Win11CUURL = 'https://catalog.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/cd35ece3-585a-48e9-a9b5-ad5cd3699d32/public/windows11.0-kb5032190-x64_fdbd38c60e7ef2c6adab4bf5b508e751ccfbd525.msu'
 $Win11CURequiredBuild = "22621"
 $Win11CURequiredUBR = "521"
 
 # Update Assistants
+$Win10UAURL = 'https://go.microsoft.com/fwlink/?LinkID=799445'
 $Win11UAURL = 'https://go.microsoft.com/fwlink/?LinkID=2171764'
 
 # Windows Update Policy registry location
@@ -115,16 +124,12 @@ $WUPolicyRegLocation = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\
 if ($null -ne $env:SyncroModule) { Import-Module $env:SyncroModule -DisableNameChecking }
 
 function Exit-WithError {
-    param ($Text)
-    if ($Datto) {
-        Write-Information "<-Start Result->Alert=$Text<-End Result->"
-    } elseif ($Syncro) {
-        Write-Information $Text
+    param ( $Text )
+    Write-Output $Text
+    if (Get-Module | Where-Object { $_.ModuleBase -match 'Syncro' }) {
         Rmm-Alert -Category "Upgrade Windows" -Body $Text
-    } else {
-        Write-Information $Text
     }
-    Start-Sleep 10 # Give us a chance to view output when running interactively
+    Start-Sleep 10 # Give us a chance to see the error when running interactively
     exit 1
 }
 
@@ -151,7 +156,7 @@ function Get-Download {
     Write-Output "Downloading: $URL ($([math]::round($DownloadSize/1MB, 2)) MB)`nDestination: $TargetFolder\$FileName..."
     # Check if file already exists
     if ($DownloadSize -ne (Get-ItemProperty $TargetFolder\$FileName -ErrorAction SilentlyContinue).Length) {
-        Start-BitsTransfer -Source $URL -Destination $TargetFolder\$FileName -Priority Normal -TransferPolicy Unrestricted
+        Start-BitsTransfer -Source $URL -Destination $TargetFolder\$FileName -Priority Normal
         # Verify download success
         $DownloadSizeOnDisk = (Get-ItemProperty $TargetFolder\$FileName -ErrorAction SilentlyContinue).Length
         if ($DownloadSize -ne $DownloadSizeOnDisk) {
@@ -216,6 +221,7 @@ function Invoke-EnablementUpgrade {
 
 function Invoke-UpdateAssistant {
     # Check for free space
+    $DiskSpaceRequired = '11' # in GBs
     $DiskSpace = [Math]::Round((Get-CimInstance -Class Win32_Volume | Where-Object { $_.DriveLetter -eq $env:SystemDrive } | Select-Object -ExpandProperty FreeSpace) / 1GB)
     if ($DiskSpace -lt $DiskSpaceRequired) {
         Exit-WithError "Only $DiskSpace GB free, $DiskSpaceRequired GB required."
@@ -265,21 +271,33 @@ function Invoke-UpdateAssistant {
 
 ### END FUNCTIONS / START MAIN SCRIPT ###
 
-# Get OS/version/build info
+# Get version/build info
+# 19041 and older do not have DisplayVersion key, if so we grab ReleaseID instead (no longer updated in new versions)
 $MajorVersion = ([System.Environment]::OSVersion.Version).Major
 $CurrentVersion = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
-$DisplayVersion = $CurrentVersion.DisplayVersion
+if ($CurrentVersion.DisplayVersion) {
+    $DisplayVersion = $CurrentVersion.DisplayVersion
+} else { $DisplayVersion = $CurrentVersion.ReleaseId }
 
 # Get build and UBR (we keep separate as UBR can be 3 or 4 digits which confuses comparison operators in combined form)
 $Build = $CurrentVersion.CurrentBuildNumber
 $UBR = $CurrentVersion.UBR
 
-# Set MajorVersion
+# Correct Microsoft's version number for Windows 11
 if ($Build -ge 22000) { $MajorVersion = '11' }
 
 # Set variables based on OS version
 switch ($MajorVersion) {
-    {10,11} {
+    10 {
+        $WinLatestVersion = $Win10LatestVersion
+        $EPRequiredBuild = $Win10EPRequiredBuild; $EPRequiredUBR = $Win10EPRequiredUBR
+        $CURequiredBuild = $Win10CURequiredBuild; $CURequiredUBR = $Win10CURequiredUBR
+        $KB = $Win10CUKB; $KBURL = $Win10CUURL; $UAURL = $Win10UAURL
+        if ([Environment]::Is64BitOperatingSystem) {
+            $EPURL = $Win10EPURLx64
+        } else { $EPURL = $Win10EPURLx86 }
+    }
+    11 {
         $WinLatestVersion = $Win11LatestVersion
         $EPRequiredBuild = $Win11EPRequiredBuild; $EPRequiredUBR = $Win11EPRequiredUBR
         $CURequiredBuild = $Win11CURequiredBuild; $CURequiredUBR = $Win11CURequiredUBR
@@ -301,23 +319,16 @@ if (-not (Test-Path -Path "$TargetFolder" -PathType Container)) {
     New-Item -Path "$TargetFolder" -ItemType Directory | Out-Null
 }
 
-# Set uninstall window
-reg add "HKLM\SYSTEM\Setup" /f /v UninstallWindow /t REG_DWORD /d $UninstallWindow | Out-Null
-
-# Remove Windows Update ProductVersion/TargetRelease registry settings
-if ($RemoveRegistryBlocks -eq $true -and ((Get-Item $WUPolicyRegLocation -ErrorAction SilentlyContinue).Property -like "TargetReleaseVersion*")) {
-    Remove-ItemProperty $WUPolicyRegLocation -Name 'ProductVersion' -ErrorAction SilentlyContinue
+# Remove Windows Update TargetReleaseVersion registry settings
+if ($RemoveTargetReleaseVersion -eq $true -and ((Get-Item $WUPolicyRegLocation).Property -like "TargetReleaseVersion*")) {
     Remove-ItemProperty $WUPolicyRegLocation -Name 'TargetReleaseVersion' -ErrorAction SilentlyContinue
     Remove-ItemProperty $WUPolicyRegLocation -Name 'TargetReleaseVersionInfo' -ErrorAction SilentlyContinue
-    Write-Output "ProductVersion/TargetRelease registry settings were found and removed."
+    Write-Output "TargetReleaseVersion registry settings were found and removed."
 }
 
 # Ineligible Upgrade Conditions
-if ($CurrentVersion.InstallationType -ne 'Client') {
-    Write-Output "Device is not running a client OS."
-    Start-Sleep 10; exit 0
-} elseif ($MajorVersion -lt '11' -and $UpgradeWindows10 -eq $false) {
-    Write-Output "Upgrading Windows 10 is disabled in script variables, exiting."
+if ($MajorVersion -lt '10') {
+    Write-Output "Windows versions prior to 10 cannot be updated with this script."
     Start-Sleep 10; exit 0
 } elseif ($DisplayVersionNumerical -ge $WinLatestVersionNumerical) {
     Write-Output "Already running $DisplayVersion which is the same or newer than target release $WinLatestVersion, no update required."
@@ -326,7 +337,7 @@ if ($CurrentVersion.InstallationType -ne 'Client') {
 } elseif ($AttemptCumulativeUpdate -eq $false -and $AttemptUpdateAssistant -eq $false -and
     $Build -lt $EPRequiredBuild -and $UBR -lt $EPRequiredUBR) {
     Exit-WithError "Windows $MajorVersion builds older than $EPRequiredBuild.$EPRequiredUBR cannot be upgraded with enablement package and Cumulative Update/Update Assistant methods are disabled."
-} elseif ($IgnoreRegistryBlocks -eq $false -and (Test-Path $WUPolicyRegLocation) -eq $true) {
+} elseif ($IgnoreTargetReleaseVersion -eq $false -and (Test-Path $WUPolicyRegLocation) -eq $true) {
     $WindowsUpdateKey = Get-ItemProperty -Path $WUPolicyRegLocation -ErrorAction SilentlyContinue
     if ($WindowsUpdateKey.TargetReleaseVersion -eq 1 -and $WindowsUpdateKey.TargetReleaseVersionInfo) {
         $WindowsUpdateTargetReleaseNumerical = ($WindowsUpdateKey.TargetReleaseVersionInfo).replace('H1', '05').replace('H2', '10')
@@ -347,9 +358,6 @@ if ($AttemptCumulativeUpdate -eq $true -and
     Invoke-EnablementUpgrade
 } elseif ($AttemptUpdateAssistant -eq $true) {
     Write-Output "Build is not compatible with enablement upgrade, attempting Update Assistant method instead."
-    Invoke-UpdateAssistant
-} elseif ($MajorVersion -lt '11' -and $UpgradeWindows10 -eq $true -and $AttemptUpdateAssistant -eq $true) {
-    Write-Output "Upgrading Windows 10 using Update Assistant method."
     Invoke-UpdateAssistant
 } else {
     Exit-WithError "Eligibility logic failed, check script for issues."
